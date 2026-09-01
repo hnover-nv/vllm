@@ -304,7 +304,9 @@ def test_recoverssm_spec_uses_one_state_slot_and_current_window(
     assert actual.recoverssm_context is context
     num_accepted_tokens = torch.tensor([3, 2, 1], dtype=torch.int32, device=device)
 
-    postprocess = actual.commit_recoverssm_state(num_accepted_tokens)
+    postprocess = KimiK3KDAMetadata.commit_recoverssm_state(
+        [actual], num_accepted_tokens
+    )
 
     if mamba_cache_mode == "none":
         assert commit_metadata.align is None
@@ -319,9 +321,10 @@ def test_recoverssm_spec_uses_one_state_slot_and_current_window(
             is common_attn_metadata.compute_num_computed_tokens()
         )
         assert postprocess.block_size == BLOCK_SIZE
-    args = context.commit.call_args.args
+    args = context.commit_groups.call_args.args
     assert args[0] is num_accepted_tokens
-    torch.testing.assert_close(args[1], commit_metadata.state_indices[:, 0])
+    assert len(args[1]) == 1
+    torch.testing.assert_close(args[1][0], commit_metadata.state_indices[:, 0])
     torch.testing.assert_close(args[2], commit_metadata.query_start_loc)
 
 

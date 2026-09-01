@@ -11,9 +11,9 @@ For Kimi-K3 speculative decoding, ``--use-replayssm`` selects the simplified
 RecoverSSM path implemented here instead of the Mamba2 ReplaySSM kernel.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from functools import cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
@@ -43,14 +43,6 @@ if TYPE_CHECKING:
     )
 
 
-@cache
-def _metadata_launch_pdl() -> bool:
-    # CUDA-graph microbenchmarks show device-side overlap from PDL, but commit
-    # normally runs eagerly. In that path PDL's host launch overhead regresses
-    # end-to-end latency, so keep the RecoverSSM commit sequence non-PDL.
-    return False
-
-
 @triton.jit(do_not_specialize=["num_requests"])
 def _get_aligned_state_indices_kernel(
     block_table_ptr,
@@ -66,12 +58,7 @@ def _get_aligned_state_indices_kernel(
     NUM_STATE_SLOTS: tl.constexpr,
     BLOCK_STATE_SLOTS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
-    launch_pdl: tl.constexpr,
 ):
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
-
     rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     valid_row = rows < num_requests
     seq_lens = tl.load(
@@ -134,7 +121,6 @@ def _mamba_get_block_table_tensor(
         BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
         BLOCK_ROWS=BLOCK_ROWS,
         num_warps=1,
-        launch_pdl=_metadata_launch_pdl(),
     )
     return state_indices
 
@@ -157,12 +143,7 @@ def _stage_spec_decode_metadata_kernel(
     BLOCK_STATE_SLOTS: tl.constexpr,
     NULL_STATE_ID: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
-    launch_pdl: tl.constexpr,
 ):
-    if launch_pdl:
-        tl.extra.cuda.gdc_wait()
-        tl.extra.cuda.gdc_launch_dependents()
-
     rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     real_request = rows < num_spec_decodes
 
@@ -240,7 +221,6 @@ def stage_spec_decode_metadata(
         NULL_STATE_ID=NULL_BLOCK_ID,
         BLOCK_ROWS=BLOCK_ROWS,
         num_warps=1,
-        launch_pdl=_metadata_launch_pdl(),
     )
 
 
@@ -265,37 +245,82 @@ class KimiK3KDAMetadata(GDNAttentionMetadata, RecoverSSMMetadata):
     recoverssm_context: "KDARecoverSSMCommitContext | None" = field(
         default=None, repr=False, compare=False
     )
+    _combined_contexts: ClassVar[
+        dict[tuple[int, ...], "KDARecoverSSMCommitContext"]
+    ] = {}
 
+    @classmethod
     def commit_recoverssm_state(
-        self, num_accepted_tokens: torch.Tensor
+        cls,
+        metadata: Sequence[RecoverSSMMetadata],
+        num_accepted_tokens: torch.Tensor,
     ) -> RecoverSSMPostprocessMetadata | None:
-        commit = self.recoverssm_commit
-        if commit is None:
-            return None
-        context = self.recoverssm_context
-        assert context is not None
-        align = commit.align
-        context.commit(
+        kda_metadata = [item for item in metadata if isinstance(item, cls)]
+        active = [item for item in kda_metadata if item.recoverssm_commit is not None]
+        assert len(kda_metadata) == len(metadata) == len(active)
+        commits = [
+            cast(KDARecoverSSMCommitMetadata, item.recoverssm_commit) for item in active
+        ]
+        first_commit = commits[0]
+        align_enabled = first_commit.align is not None
+        assert all(
+            (commit.align is not None) == align_enabled
+            and item.num_spec_decodes == active[0].num_spec_decodes
+            for item, commit in zip(active, commits, strict=True)
+        )
+
+        contexts = [item.recoverssm_context for item in active]
+        assert all(context is not None for context in contexts)
+        context_key = tuple(id(context) for context in contexts)
+        context = cls._combined_contexts.get(context_key)
+        if context is None:
+            from vllm.models.kimi_k3.nvidia.ops.recoverssm import (
+                KDARecoverSSMCommitContext,
+            )
+
+            # Pack all group layers for the all-layer commit kernels while
+            # retaining group-local state indices and plan rows.
+            context = KDARecoverSSMCommitContext.combine(contexts)  # type: ignore[arg-type]
+            cls._combined_contexts[context_key] = context
+
+        if align_enabled:
+            aligns = [
+                cast(KDARecoverSSMAlignMetadata, commit.align) for commit in commits
+            ]
+            first_align = aligns[0]
+            block_tables = [align.block_table for align in aligns]
+            num_computed_tokens = first_align.num_computed_tokens
+            mamba_block_size = first_align.block_size
+        else:
+            block_tables = None
+            num_computed_tokens = None
+            mamba_block_size = None
+
+        context.commit_groups(
             num_accepted_tokens,
-            commit.state_indices[: self.num_spec_decodes, 0],
-            commit.query_start_loc[: self.num_spec_decodes + 1],
-            request_indices=commit.request_indices,
-            block_table=align.block_table if align is not None else None,
-            num_computed_tokens=(
-                align.num_computed_tokens if align is not None else None
-            ),
-            mamba_block_size=align.block_size if align is not None else None,
-            use_pdl=_metadata_launch_pdl(),
+            [
+                commit.state_indices[: active[0].num_spec_decodes, 0]
+                for commit in commits
+            ],
+            first_commit.query_start_loc[: active[0].num_spec_decodes + 1],
+            request_indices=first_commit.request_indices,
+            block_tables=block_tables,
+            num_computed_tokens=num_computed_tokens,
+            mamba_block_size=mamba_block_size,
         )
-        if align is None:
-            return None
-        return RecoverSSMPostprocessMetadata(
-            num_spec_decodes=self.num_spec_decodes,
-            request_indices=commit.request_indices,
-            block_table=align.block_table,
-            num_computed_tokens=align.num_computed_tokens,
-            block_size=align.block_size,
-        )
+
+        postprocess = None
+        if align_enabled:
+            assert first_commit.align is not None
+            align = first_commit.align
+            postprocess = RecoverSSMPostprocessMetadata(
+                num_spec_decodes=active[0].num_spec_decodes,
+                request_indices=first_commit.request_indices,
+                block_table=align.block_table,
+                num_computed_tokens=align.num_computed_tokens,
+                block_size=align.block_size,
+            )
+        return postprocess
 
 
 class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):

@@ -243,16 +243,19 @@ def _kda_recoverssm_verify_kernel(
 @triton.heuristics(
     {
         "HAS_REQUEST_INDICES": lambda args: args["request_indices_ptr"] is not None,
-        "ALIGN_MODE": lambda args: args["block_table_ptr"] is not None,
+        "ALIGN_MODE": lambda args: args["block_table_ref_ptr"] is not None,
     }
 )
 @triton.jit
-def _prepare_commit_plan_kernel(
+def _prepare_group_commit_plan_kernel(
     num_accepted_ptr,
     request_indices_ptr,
     state_indices_ptr,
     query_start_loc_ptr,
-    block_table_ptr,
+    block_table_ref_ptr,
+    block_table_base_addrs_ptr,
+    block_table_row_strides_ptr,
+    block_table_col_strides_ptr,
     num_computed_ptr,
     commit_lens_ptr,
     final_state_indices_ptr,
@@ -263,19 +266,24 @@ def _prepare_commit_plan_kernel(
     block_table_width,
     stride_num_accepted,
     stride_request_indices,
-    stride_state_indices,
+    stride_state_indices_group,
+    stride_state_indices_request,
     stride_query_start_loc,
-    stride_block_table_row,
-    stride_block_table_col,
     stride_num_computed,
+    stride_plan_group,
     SPEC_QUERY_LEN: tl.constexpr,
     HAS_REQUEST_INDICES: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
 ):
     spec_idx = tl.program_id(0)
-    source_state_idx = tl.load(state_indices_ptr + spec_idx * stride_state_indices).to(
-        tl.int64
-    )
+    group_idx = tl.program_id(1)
+    # Plan one row per cache group and request. All-layer commit kernels use
+    # layer_group_ids to select the matching row.
+    source_state_idx = tl.load(
+        state_indices_ptr
+        + group_idx * stride_state_indices_group
+        + spec_idx * stride_state_indices_request
+    ).to(tl.int64)
     request_idx = spec_idx
     if HAS_REQUEST_INDICES:
         request_idx = tl.load(
@@ -299,37 +307,44 @@ def _prepare_commit_plan_kernel(
         num_computed = tl.load(num_computed_ptr + request_idx * stride_num_computed).to(
             tl.int32
         )
+        block_table_base_addr = tl.load(block_table_base_addrs_ptr + group_idx)
+        block_table_ptr = block_table_base_addr.to(
+            tl.pointer_type(block_table_ref_ptr.dtype.element_ty)
+        )
+        block_table_row_stride = tl.load(block_table_row_strides_ptr + group_idx)
+        block_table_col_stride = tl.load(block_table_col_strides_ptr + group_idx)
         final_num_computed = num_computed + commit_len
         final_state_col = tl.minimum(
             final_num_computed // mamba_block_size, block_table_width - 1
         )
         final_state_idx = tl.load(
             block_table_ptr
-            + request_idx * stride_block_table_row
-            + final_state_col * stride_block_table_col
+            + request_idx * block_table_row_stride
+            + final_state_col * block_table_col_stride
         ).to(tl.int64)
         next_boundary = (num_computed // mamba_block_size + 1) * mamba_block_size
         crosses_boundary = final_num_computed >= next_boundary
         boundary_recovery_len = next_boundary - num_computed
         boundary_state_idx = tl.load(
             block_table_ptr
-            + request_idx * stride_block_table_row
-            + (next_boundary // mamba_block_size - 1) * stride_block_table_col,
+            + request_idx * block_table_row_stride
+            + (next_boundary // mamba_block_size - 1) * block_table_col_stride,
             mask=crosses_boundary,
             other=null_block_id,
         ).to(tl.int64)
     valid = (source_state_idx > null_block_id) & (commit_len > 0)
-    tl.store(commit_lens_ptr + spec_idx, tl.where(valid, commit_len, 0))
+    plan_offset = group_idx * stride_plan_group + spec_idx
+    tl.store(commit_lens_ptr + plan_offset, tl.where(valid, commit_len, 0))
     tl.store(
-        final_state_indices_ptr + spec_idx,
+        final_state_indices_ptr + plan_offset,
         tl.where(valid, final_state_idx, null_block_id),
     )
     tl.store(
-        boundary_state_indices_ptr + spec_idx,
+        boundary_state_indices_ptr + plan_offset,
         tl.where(valid, boundary_state_idx, null_block_id),
     )
     tl.store(
-        boundary_recovery_lens_ptr + spec_idx,
+        boundary_recovery_lens_ptr + plan_offset,
         tl.where(valid, boundary_recovery_len, 0),
     )
 
@@ -351,10 +366,7 @@ def _compact_conv_num_warps(args: dict[str, Any]) -> int:
 
 
 @triton.heuristics(
-    {
-        "BLOCK_D": _compact_conv_block_d,
-        "num_warps": _compact_conv_num_warps,
-    }
+    {"BLOCK_D": _compact_conv_block_d, "num_warps": _compact_conv_num_warps}
 )
 @triton.jit
 def _compact_conv_state_kernel(
@@ -363,6 +375,7 @@ def _compact_conv_state_kernel(
     conv_state_block_strides_ptr,
     conv_state_dim_strides_ptr,
     conv_state_token_strides_ptr,
+    layer_group_ids_ptr,
     state_indices_ptr,
     commit_lens_ptr,
     final_state_indices_ptr,
@@ -371,7 +384,9 @@ def _compact_conv_state_kernel(
     null_block_id,
     conv_dim,
     conv_history_len,
+    stride_state_indices_group,
     stride_state_indices,
+    stride_plan_group,
     BLOCK_D: tl.constexpr,
     BLOCK_HISTORY: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
@@ -380,18 +395,23 @@ def _compact_conv_state_kernel(
     pid_d = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_l = tl.program_id(2)
-    source_state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(
-        tl.int64
-    )
+    # Each packed layer selects its cache group's state-index and plan row.
+    group_idx = tl.load(layer_group_ids_ptr + pid_l)
+    source_state_idx = tl.load(
+        state_indices_ptr
+        + group_idx * stride_state_indices_group
+        + pid_b * stride_state_indices
+    ).to(tl.int64)
     if source_state_idx <= null_block_id:
         return
 
-    commit_len = tl.load(commit_lens_ptr + pid_b)
+    plan_offset = group_idx * stride_plan_group + pid_b
+    commit_len = tl.load(commit_lens_ptr + plan_offset)
     if commit_len == 0:
         return
-    final_state_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
-    boundary_state_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
-    boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + pid_b)
+    final_state_idx = tl.load(final_state_indices_ptr + plan_offset).to(tl.int64)
+    boundary_state_idx = tl.load(boundary_state_indices_ptr + plan_offset).to(tl.int64)
+    boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + plan_offset)
 
     if final_state_idx <= null_block_id:
         return
@@ -450,12 +470,7 @@ def _commit_kda_num_warps(args: dict[str, Any]) -> int:
     return 4 if args["BATCH"] == 1 else 2 if args["BATCH"] == 2 else 1
 
 
-@triton.heuristics(
-    {
-        "BV": _commit_kda_value_block,
-        "num_warps": _commit_kda_num_warps,
-    }
-)
+@triton.heuristics({"BV": _commit_kda_value_block, "num_warps": _commit_kda_num_warps})
 @triton.jit
 def _commit_kda_state_kernel(
     state_ref_ptr,
@@ -469,6 +484,7 @@ def _commit_kda_state_kernel(
     kg_cache_block_strides_ptr,
     A_log_ptr,
     dt_bias_ptr,
+    layer_group_ids_ptr,
     state_indices_ptr,
     commit_lens_ptr,
     final_state_indices_ptr,
@@ -490,7 +506,9 @@ def _commit_kda_state_kernel(
     stride_dt_bias_layer,
     stride_dt_bias_head,
     stride_dt_bias_dim,
+    stride_state_indices_group,
     stride_state_indices,
+    stride_plan_group,
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
@@ -498,33 +516,29 @@ def _commit_kda_state_kernel(
     NUM_HEADS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     ALIGN_MODE: tl.constexpr,
-    BATCH: tl.constexpr,
-    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
 ):
-    if LAUNCH_DEPENDENT_KERNELS:
-        # Expected operation is plan -> KDA commit -> conv where plan and KDA
-        # are launched normally, conv is launched as a dependent kernel and KDA
-        # immediately releases conv.  This guarantees correctness as both KDA
-        # and conv depend on the plan but not each other.  Better than two
-        # streams as we want to make sure KDA goes first, as it is longer tailed.
-        tl.extra.cuda.gdc_launch_dependents()
     pid_v = tl.program_id(0)
     pid_b = tl.program_id(1)
     pid_lh = tl.program_id(2)
     pid_l = pid_lh // NUM_HEADS
     pid_h = pid_lh % NUM_HEADS
+    # Packed layers select group-local plan data.
+    group_idx = tl.load(layer_group_ids_ptr + pid_l)
 
-    source_state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(
-        tl.int64
-    )
+    source_state_idx = tl.load(
+        state_indices_ptr
+        + group_idx * stride_state_indices_group
+        + pid_b * stride_state_indices
+    ).to(tl.int64)
     if source_state_idx <= null_block_id:
         return
-    commit_len = tl.load(commit_lens_ptr + pid_b)
+    plan_offset = group_idx * stride_plan_group + pid_b
+    commit_len = tl.load(commit_lens_ptr + plan_offset)
     if commit_len == 0:
         return
-    final_state_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
-    boundary_state_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
-    boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + pid_b)
+    final_state_idx = tl.load(final_state_indices_ptr + plan_offset).to(tl.int64)
+    boundary_state_idx = tl.load(boundary_state_indices_ptr + plan_offset).to(tl.int64)
+    boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + plan_offset)
 
     if final_state_idx <= null_block_id:
         return
@@ -804,6 +818,12 @@ class KDARecoverSSMCommitContext:
     dt_bias: torch.Tensor
     lower_bound: float | None
     spec_query_len: int
+    layer_group_ids: torch.Tensor
+    num_groups: int = 1
+    staged_state_indices: torch.Tensor | None = None
+    align_block_table_base_addrs: torch.Tensor | None = None
+    align_block_table_row_strides: torch.Tensor | None = None
+    align_block_table_col_strides: torch.Tensor | None = None
 
     @classmethod
     def create(
@@ -955,6 +975,93 @@ class KDARecoverSSMCommitContext:
             dt_bias=torch.stack(tuple(dt_bias)).contiguous(),
             lower_bound=lower_bounds.pop(),
             spec_query_len=spec_query_len,
+            layer_group_ids=torch.zeros(len(layers), dtype=torch.int32, device=device),
+        )
+
+    @classmethod
+    def combine(
+        cls, contexts: Sequence["KDARecoverSSMCommitContext"]
+    ) -> "KDARecoverSSMCommitContext":
+        """Combine compatible KDA cache groups for all-layer commit kernels."""
+        if not contexts:
+            raise ValueError("KDA RecoverSSM commit requires at least one context")
+        if len(contexts) == 1:
+            return contexts[0]
+
+        reference = contexts[0]
+        state_ref = reference.checkpoints[0]
+        for context in contexts[1:]:
+            if (
+                context.spec_query_len != reference.spec_query_len
+                or context.lower_bound != reference.lower_bound
+                or context.conv_history_len != reference.conv_history_len
+                or context.checkpoints[0].shape != state_ref.shape
+                or context.checkpoints[0].dtype != state_ref.dtype
+                or context.checkpoints[0].stride()[1:] != state_ref.stride()[1:]
+                or context.conv_states[0].shape[1:]
+                != reference.conv_states[0].shape[1:]
+                or context.conv_states[0].dtype != reference.conv_states[0].dtype
+                or context.commit_lens.shape[-1] != reference.commit_lens.shape[-1]
+            ):
+                raise ValueError("KDA RecoverSSM commit groups are incompatible")
+
+        def _flatten(name: str) -> tuple[torch.Tensor, ...]:
+            return tuple(
+                tensor for context in contexts for tensor in getattr(context, name)
+            )
+
+        def _cat(name: str) -> torch.Tensor:
+            return torch.cat(tuple(getattr(context, name) for context in contexts))
+
+        num_groups = len(contexts)
+        max_num_reqs = reference.commit_lens.shape[-1]
+        device = state_ref.device
+        layer_counts = torch.tensor(
+            [len(context.checkpoints) for context in contexts],
+            dtype=torch.int32,
+            device=device,
+        )
+        return cls(
+            conv_states=_flatten("conv_states"),
+            conv_state_base_addrs=_cat("conv_state_base_addrs"),
+            conv_state_block_strides=_cat("conv_state_block_strides"),
+            conv_state_dim_strides=_cat("conv_state_dim_strides"),
+            conv_state_token_strides=_cat("conv_state_token_strides"),
+            conv_history_len=reference.conv_history_len,
+            checkpoints=_flatten("checkpoints"),
+            state_base_addrs=_cat("state_base_addrs"),
+            state_block_strides=_cat("state_block_strides"),
+            correction_caches=_flatten("correction_caches"),
+            correction_cache_base_addrs=_cat("correction_cache_base_addrs"),
+            correction_cache_block_strides=_cat("correction_cache_block_strides"),
+            kg_caches=_flatten("kg_caches"),
+            kg_cache_base_addrs=_cat("kg_cache_base_addrs"),
+            kg_cache_block_strides=_cat("kg_cache_block_strides"),
+            commit_lens=torch.empty(
+                (num_groups, max_num_reqs), dtype=torch.int32, device=device
+            ),
+            final_state_indices=torch.empty(
+                (num_groups, max_num_reqs), dtype=torch.int32, device=device
+            ),
+            boundary_state_indices=torch.empty(
+                (num_groups, max_num_reqs), dtype=torch.int32, device=device
+            ),
+            boundary_recovery_lens=torch.empty(
+                (num_groups, max_num_reqs), dtype=torch.int32, device=device
+            ),
+            A_log=torch.cat(tuple(context.A_log for context in contexts)).contiguous(),
+            dt_bias=torch.cat(
+                tuple(context.dt_bias for context in contexts)
+            ).contiguous(),
+            lower_bound=reference.lower_bound,
+            spec_query_len=reference.spec_query_len,
+            layer_group_ids=torch.repeat_interleave(
+                torch.arange(num_groups, dtype=torch.int32, device=device), layer_counts
+            ),
+            num_groups=num_groups,
+            staged_state_indices=torch.empty(
+                (num_groups, max_num_reqs), dtype=torch.int32, device=device
+            ),
         )
 
     def commit(
@@ -966,61 +1073,102 @@ class KDARecoverSSMCommitContext:
         block_table: torch.Tensor | None = None,
         num_computed_tokens: torch.Tensor | None = None,
         mamba_block_size: int | None = None,
-        use_pdl: bool = False,
     ) -> None:
-        """Fold accepted KDA and convolution inputs into every layer."""
-        batch = state_indices.shape[0]
+        """Fold accepted inputs into one KDA cache group."""
+        self.commit_groups(
+            num_accepted_tokens,
+            [state_indices],
+            query_start_loc,
+            request_indices=request_indices,
+            block_tables=[block_table] if block_table is not None else None,
+            num_computed_tokens=num_computed_tokens,
+            mamba_block_size=mamba_block_size,
+        )
+
+    def commit_groups(
+        self,
+        num_accepted_tokens: torch.Tensor,
+        state_indices: Sequence[torch.Tensor],
+        query_start_loc: torch.Tensor,
+        request_indices: torch.Tensor | None = None,
+        block_tables: Sequence[torch.Tensor] | None = None,
+        num_computed_tokens: torch.Tensor | None = None,
+        mamba_block_size: int | None = None,
+    ) -> None:
+        """Fold accepted inputs into all layers from compatible KDA cache groups."""
+        if len(state_indices) != self.num_groups:
+            raise ValueError("KDA RecoverSSM commit groups are incompatible")
+        batch = state_indices[0].shape[0]
         if batch == 0:
             return
-        if batch > self.commit_lens.shape[0]:
+        if any(indices.shape != state_indices[0].shape for indices in state_indices):
+            raise ValueError("KDA RecoverSSM state-index shapes are incompatible")
+        if batch > self.commit_lens.shape[-1]:
             raise ValueError("KDA RecoverSSM commit batch exceeds its plan capacity")
         if query_start_loc.shape[0] != batch + 1:
             raise ValueError("KDA RecoverSSM commit metadata is incompatible")
         if request_indices is not None and request_indices.shape[0] < batch:
             raise ValueError("KDA RecoverSSM request mapping is too short")
-        align_args = (block_table, num_computed_tokens, mamba_block_size)
-        if any(arg is not None for arg in align_args) and any(
-            arg is None for arg in align_args
-        ):
-            raise ValueError("KDA RecoverSSM align metadata is incomplete")
         if mamba_block_size is not None and mamba_block_size < self.spec_query_len:
             raise ValueError(
                 "KDA RecoverSSM align block size must cover one speculative window"
             )
-        if block_table is not None and block_table.ndim != 2:
-            raise ValueError("KDA RecoverSSM block table must be two-dimensional")
-        device = self.checkpoints[0].device
-        if (
-            any(
-                tensor.device != device
-                for tensor in (
-                    num_accepted_tokens,
-                    state_indices,
-                    query_start_loc,
-                )
-            )
-            or (request_indices is not None and request_indices.device != device)
-            or (block_table is not None and block_table.device != device)
-            or (
-                num_computed_tokens is not None and num_computed_tokens.device != device
-            )
-        ):
-            raise ValueError("KDA RecoverSSM commit inputs must be on the same device")
+        if block_tables is not None and len(block_tables) != self.num_groups:
+            raise ValueError("KDA RecoverSSM align block tables are incompatible")
 
-        block_table_stride = (0, 0) if block_table is None else block_table.stride()
-        num_computed_stride = (
-            0 if num_computed_tokens is None else num_computed_tokens.stride(0)
-        )
-        num_layers = len(self.checkpoints)
-        conv_ref = self.conv_states[0]
-        conv_dim = conv_ref.shape[1]
-        block_history = triton.next_power_of_2(self.conv_history_len)
-        _prepare_commit_plan_kernel[(batch,)](
+        if self.num_groups == 1:
+            staged_state_indices = state_indices[0][None]
+            plan_group_stride = 0
+        else:
+            assert self.staged_state_indices is not None
+            staged_state_indices = self.staged_state_indices[:, :batch]
+            torch.stack(state_indices, out=staged_state_indices)
+            plan_group_stride = self.commit_lens.stride(0)
+
+        block_table_ref = None
+        block_table_base_addrs = self.state_base_addrs
+        block_table_row_strides = self.state_block_strides
+        block_table_col_strides = self.state_block_strides
+        block_table_width = 1
+        if block_tables is not None:
+            if any(table.ndim != 2 for table in block_tables):
+                raise ValueError("KDA RecoverSSM block table must be two-dimensional")
+            if len({table.shape[1] for table in block_tables}) != 1:
+                raise ValueError("KDA RecoverSSM block table widths are incompatible")
+            block_table_ref = block_tables[0]
+            block_table_width = block_table_ref.shape[1]
+            if self.align_block_table_base_addrs is None:
+                device = self.checkpoints[0].device
+                self.align_block_table_base_addrs = torch.tensor(
+                    [table.data_ptr() for table in block_tables],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                self.align_block_table_row_strides = torch.tensor(
+                    [table.stride(0) for table in block_tables],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                self.align_block_table_col_strides = torch.tensor(
+                    [table.stride(1) for table in block_tables],
+                    dtype=torch.int64,
+                    device=device,
+                )
+            assert self.align_block_table_row_strides is not None
+            assert self.align_block_table_col_strides is not None
+            block_table_base_addrs = self.align_block_table_base_addrs
+            block_table_row_strides = self.align_block_table_row_strides
+            block_table_col_strides = self.align_block_table_col_strides
+
+        _prepare_group_commit_plan_kernel[(batch, self.num_groups)](
             num_accepted_tokens,
             request_indices,
-            state_indices,
+            staged_state_indices,
             query_start_loc,
-            block_table,
+            block_table_ref,
+            block_table_base_addrs,
+            block_table_row_strides,
+            block_table_col_strides,
             num_computed_tokens,
             self.commit_lens,
             self.final_state_indices,
@@ -1028,29 +1176,58 @@ class KDARecoverSSMCommitContext:
             self.boundary_recovery_lens,
             NULL_BLOCK_ID,
             mamba_block_size or 1,
-            block_table.shape[1] if block_table is not None else 1,
+            block_table_width,
             num_accepted_tokens.stride(0),
             request_indices.stride(0) if request_indices is not None else 0,
-            state_indices.stride(0),
+            staged_state_indices.stride(0),
+            staged_state_indices.stride(1),
             query_start_loc.stride(0),
-            block_table_stride[0],
-            block_table_stride[1],
-            num_computed_stride,
+            0 if num_computed_tokens is None else num_computed_tokens.stride(0),
+            plan_group_stride,
             SPEC_QUERY_LEN=self.spec_query_len,
             num_warps=1,
         )
+
         state_ref = self.checkpoints[0]
         _, num_heads, value_dim, key_dim = state_ref.shape
         block_k = triton.next_power_of_2(key_dim)
+        num_layers = len(self.checkpoints)
+        conv_ref = self.conv_states[0]
+        conv_dim = conv_ref.shape[1]
+        block_history = triton.next_power_of_2(self.conv_history_len)
+        conv_grid = lambda meta: (
+            triton.cdiv(meta["conv_dim"], meta["BLOCK_D"]),
+            batch,
+            num_layers,
+        )
+        _compact_conv_state_kernel[conv_grid](
+            conv_ref,
+            self.conv_state_base_addrs,
+            self.conv_state_block_strides,
+            self.conv_state_dim_strides,
+            self.conv_state_token_strides,
+            self.layer_group_ids,
+            staged_state_indices,
+            self.commit_lens,
+            self.final_state_indices,
+            self.boundary_state_indices,
+            self.boundary_recovery_lens,
+            NULL_BLOCK_ID,
+            conv_dim,
+            self.conv_history_len,
+            staged_state_indices.stride(0),
+            staged_state_indices.stride(1),
+            plan_group_stride,
+            BLOCK_HISTORY=block_history,
+            ALIGN_MODE=block_tables is not None,
+            BATCH=batch,
+        )
+
         grid = lambda meta: (
             triton.cdiv(meta["V"], meta["BV"]),
             batch,
             num_layers * num_heads,
         )
-        # This deliberately reverses the natural conv-then-KDA order. KDA's
-        # longer execution leaves more useful tail time for compact to overlap.
-        # Do not set launch_pdl here: KDA consumes the plan output and must run
-        # normally; LAUNCH_DEPENDENT_KERNELS makes it the producer for compact.
         _commit_kda_state_kernel[grid](
             state_ref,
             self.state_base_addrs,
@@ -1063,7 +1240,8 @@ class KDARecoverSSMCommitContext:
             self.kg_cache_block_strides,
             self.A_log,
             self.dt_bias,
-            state_indices,
+            self.layer_group_ids,
+            staged_state_indices,
             self.commit_lens,
             self.final_state_indices,
             self.boundary_state_indices,
@@ -1084,45 +1262,17 @@ class KDARecoverSSMCommitContext:
             self.dt_bias.stride(0),
             self.dt_bias.stride(1),
             self.dt_bias.stride(2),
-            state_indices.stride(0),
+            staged_state_indices.stride(0),
+            staged_state_indices.stride(1),
+            plan_group_stride,
             K=key_dim,
             V=value_dim,
             BK=block_k,
             NUM_HEADS=num_heads,
             USE_LOWER_BOUND=self.lower_bound is not None,
-            ALIGN_MODE=block_table is not None,
+            ALIGN_MODE=block_tables is not None,
             BATCH=batch,
-            LAUNCH_DEPENDENT_KERNELS=use_pdl,
             num_stages=2,
-        )
-        # Compact is the PDL-dependent consumer, with no PDL instruction in
-        # its body. Every input it reads is ready before the dependency is
-        # released: stream order completes the plan before KDA starts, and
-        # compact reads no KDA output.
-        conv_grid = lambda meta: (
-            triton.cdiv(meta["conv_dim"], meta["BLOCK_D"]),
-            batch,
-            num_layers,
-        )
-        _compact_conv_state_kernel[conv_grid](
-            conv_ref,
-            self.conv_state_base_addrs,
-            self.conv_state_block_strides,
-            self.conv_state_dim_strides,
-            self.conv_state_token_strides,
-            state_indices,
-            self.commit_lens,
-            self.final_state_indices,
-            self.boundary_state_indices,
-            self.boundary_recovery_lens,
-            NULL_BLOCK_ID,
-            conv_dim,
-            self.conv_history_len,
-            state_indices.stride(0),
-            BLOCK_HISTORY=block_history,
-            ALIGN_MODE=block_table is not None,
-            BATCH=batch,
-            launch_pdl=use_pdl,
         )
 
 

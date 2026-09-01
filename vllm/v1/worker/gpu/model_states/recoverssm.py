@@ -48,23 +48,26 @@ class RecoverSSMState:
         if isinstance(num_sampled, int) or step is None:
             return
 
-        for metadata in step:
-            postprocess_meta = metadata.commit_recoverssm_state(num_sampled)
-            if postprocess_meta is None:
-                continue
-            assert state_indices is not None
-            # RecoverSSM already restored the accepted state. Update its running
-            # column and reset the next-step copy bias to the neutral value.
-            _postprocess_recoverssm_align_kernel[(postprocess_meta.num_spec_decodes,)](
-                idx_mapping,
-                num_sampled,
-                postprocess_meta.request_indices,
-                postprocess_meta.num_computed_tokens,
-                state_indices,
-                num_accepted_tokens,
-                MAMBA_BLOCK_SIZE=postprocess_meta.block_size,
-                BLOCK_TABLE_WIDTH=postprocess_meta.block_table.shape[1],
-            )
+        metadata_type = type(step[0])
+        assert all(type(metadata) is metadata_type for metadata in step)
+        # Metadata is one object per cache group. The backend plans per group,
+        # then launches convolution and KDA commit across all their layers.
+        postprocess_meta = metadata_type.commit_recoverssm_state(step, num_sampled)
+        if postprocess_meta is None:
+            return
+        assert state_indices is not None
+        # RecoverSSM already restored the accepted state. Update its running
+        # column and reset the next-step copy bias to the neutral value.
+        _postprocess_recoverssm_align_kernel[(postprocess_meta.num_spec_decodes,)](
+            idx_mapping,
+            num_sampled,
+            postprocess_meta.request_indices,
+            postprocess_meta.num_computed_tokens,
+            state_indices,
+            num_accepted_tokens,
+            MAMBA_BLOCK_SIZE=postprocess_meta.block_size,
+            BLOCK_TABLE_WIDTH=postprocess_meta.block_table.shape[1],
+        )
 
 
 @triton.heuristics(

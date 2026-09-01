@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import abc
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -19,8 +20,12 @@ class RecoverSSMPostprocessMetadata:
 
 
 class RecoverSSMMetadata(abc.ABC):
+    @classmethod
     @abc.abstractmethod
     def commit_recoverssm_state(
-        self, num_accepted_tokens: torch.Tensor
+        cls,
+        metadata: Sequence["RecoverSSMMetadata"],
+        num_accepted_tokens: torch.Tensor,
     ) -> RecoverSSMPostprocessMetadata | None:
+        """Restore accepted state for all compatible attention groups."""
         raise NotImplementedError

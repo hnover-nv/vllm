@@ -876,6 +876,41 @@ def test_kda_recoverssm_verify_and_group_commit(
                     ]
                 torch.testing.assert_close(actual_boundary_conv, expected_boundary_conv)
 
+    expected_conv_states = [layer.kv_cache[0].clone() for layer in layers]
+    for layer, state, conv_state in zip(layers, initial_states, initial_conv_states):
+        layer.kv_cache[1].copy_(state)
+        layer.kv_cache[0].copy_(conv_state)
+    combined_context = KDARecoverSSMCommitContext.combine(
+        [
+            KDARecoverSSMCommitContext.create(
+                [layer],
+                spec_query_len=query_len,
+                max_num_reqs=global_num_accepted.shape[0],
+            )
+            for layer in layers
+        ]
+    )
+    block_tables = (
+        [block_table.clone() for _ in layers] if block_table is not None else None
+    )
+    combined_context.commit_groups(
+        global_num_accepted,
+        [state_indices for _ in layers],
+        query_start_loc,
+        request_indices=request_indices,
+        block_tables=block_tables,
+        num_computed_tokens=num_computed_tokens,
+        mamba_block_size=mamba_block_size,
+    )
+    for layer_idx, layer in enumerate(layers):
+        torch.testing.assert_close(
+            layer.kv_cache[1],
+            expected_states[layer_idx],
+            atol=3e-3,
+            rtol=3e-3,
+        )
+        torch.testing.assert_close(layer.kv_cache[0], expected_conv_states[layer_idx])
+
 
 @pytest.mark.parametrize(
     ("num_heads", "num_seqs", "lower_bound", "fuse_output_norm"),
